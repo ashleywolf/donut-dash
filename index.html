@@ -1,0 +1,1043 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Donut Dash</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #1a0a2e; touch-action: none; }
+canvas { display: block; width: 100%; height: 100%; }
+#perm-overlay {
+  position: fixed; inset: 0; background: rgba(26,10,46,0.95);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  z-index: 10; font-family: 'Trebuchet MS', sans-serif; color: #fff; text-align: center;
+  padding: 20px;
+}
+#perm-overlay h2 { font-size: 24px; margin-bottom: 16px; color: #ff9ecf; }
+#perm-overlay p { font-size: 16px; margin-bottom: 24px; max-width: 320px; line-height: 1.5; }
+#perm-btn {
+  background: #ff6eb4; color: #fff; border: none; border-radius: 30px;
+  padding: 14px 36px; font-size: 18px; font-weight: bold; cursor: pointer;
+}
+#perm-btn:active { background: #e055a0; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<div id="perm-overlay" class="hidden">
+  <h2>🍩 Donut Dash needs motion access!</h2>
+  <p>Tilt your phone to steer the donut. Tap the button below to allow motion sensors.</p>
+  <button id="perm-btn">Allow Motion</button>
+</div>
+
+<canvas id="c"></canvas>
+
+<script>
+// ─── SETUP ───────────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W, H;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ─── CONSTANTS ───────────────────────────────────────────
+const DONUT_R = 22;
+const DONUT_HOLE = 8;
+const GRAVITY = 0.55;
+const JUMP_FORCE = -11.5;
+const MAX_SPEED_X = 8;
+const TILT_SENSITIVITY = 0.12;
+const PLATFORM_H = 18;
+const COLLECTIBLE_R = 8;
+const BOOST_DURATION = 90; // frames
+const BOOST_MULT = 1.8;
+const CAMERA_LEAD = 120;
+
+// ─── COLORS ──────────────────────────────────────────────
+const C = {
+  sky1: '#4a1a7a', sky2: '#1a0a2e',
+  donutBase: '#d4884a', donutGlaze: '#ff6eb4', donutHole: '#8b4513',
+  platform: '#6a3d9a', platformEdge: '#ff9ecf', platformTop: '#9b6fcf',
+  gap: '#0d0520',
+  sprinkleColors: ['#ff4444', '#44ff44', '#4488ff', '#ffff44', '#ff44ff', '#44ffff'],
+  boost: '#00e5ff', boostGlow: 'rgba(0,229,255,0.3)',
+  movingPlat: '#ff9ecf', movingEdge: '#ffccee',
+  hill: '#7b4fb5',
+  cloud: 'rgba(255,255,255,0.08)',
+  text: '#fff', textShadow: '#ff6eb4',
+  finishLine: '#ffd700',
+};
+
+// ─── GAME STATE ──────────────────────────────────────────
+let state = 'title'; // title, playing, dead, win
+let donut, camera, score, sprinklesCollected, boostTimer, deathTimer, winTimer;
+let platforms, collectibles, boosts, movingPlatforms, clouds, particles;
+let levelEnd, frameCount, bestScore;
+let tiltX = 0;
+let keysDown = {};
+let hasMotion = false;
+let motionPermGranted = false;
+
+// ─── AUDIO ───────────────────────────────────────────────
+let audioCtx;
+function ensureAudio() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+function playTone(freq, dur, type, vol) {
+  ensureAudio();
+  const osc = audioCtx.createOscillator();
+  const gain = audioCtx.createGain();
+  osc.type = type || 'square';
+  osc.frequency.value = freq;
+  gain.gain.value = vol || 0.1;
+  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + dur);
+  osc.connect(gain);
+  gain.connect(audioCtx.destination);
+  osc.start();
+  osc.stop(audioCtx.currentTime + dur);
+}
+function sfxJump() { playTone(440, 0.15, 'sine', 0.12); playTone(660, 0.12, 'sine', 0.08); }
+function sfxCollect() { playTone(880, 0.08, 'sine', 0.1); playTone(1100, 0.1, 'sine', 0.08); }
+function sfxBoost() { playTone(330, 0.2, 'sawtooth', 0.06); playTone(660, 0.15, 'sawtooth', 0.04); }
+function sfxDeath() { playTone(200, 0.3, 'square', 0.1); playTone(120, 0.4, 'square', 0.08); }
+function sfxWin() {
+  [523, 659, 784, 1047].forEach((f, i) => {
+    setTimeout(() => playTone(f, 0.2, 'sine', 0.1), i * 120);
+  });
+}
+
+// Load best score
+bestScore = parseInt(localStorage.getItem('donutDashBest') || '0');
+
+function initGame() {
+  frameCount = 0;
+  score = 0;
+  sprinklesCollected = 0;
+  boostTimer = 0;
+  deathTimer = 0;
+  winTimer = 0;
+  particles = [];
+  generateLevel();
+  donut = {
+    x: 80, y: platforms[0].y - DONUT_R - 10,
+    vx: 0, vy: 0,
+    grounded: false, rotation: 0,
+    alive: true
+  };
+  camera = { x: 0, y: 0 };
+}
+
+// ─── LEVEL GENERATION ────────────────────────────────────
+function generateLevel() {
+  platforms = [];
+  collectibles = [];
+  boosts = [];
+  movingPlatforms = [];
+  clouds = [];
+
+  let cx = 0;
+  let cy = H * 0.45;
+  const segments = 50;
+
+  // Starting flat area
+  platforms.push({ x: cx, y: cy, w: 280, angle: 0 });
+  cx += 280;
+
+  for (let i = 0; i < segments; i++) {
+    const progress = i / segments; // 0 to 1
+    const difficulty = progress * progress; // quadratic curve, gets harder faster near end
+
+    // Random segment type weighted by difficulty
+    const roll = Math.random();
+
+    if (roll < 0.25) {
+      // Downward ramp
+      const slopeLen = 140 + Math.random() * 120;
+      const drop = 30 + difficulty * 80 + Math.random() * 40;
+      const newY = Math.min(cy + drop, H * 0.82);
+      platforms.push({ x: cx, y: cy, w: slopeLen, angle: 0, endY: newY });
+      // Place collectibles along ramp
+      if (Math.random() < 0.6) {
+        const mx = cx + slopeLen * 0.5;
+        const my = lerp(cy, newY, 0.5) - 50 - Math.random() * 30;
+        collectibles.push({ x: mx, y: my, collected: false });
+      }
+      cy = newY;
+      cx += slopeLen;
+    } else if (roll < 0.45) {
+      // Gap (must jump)
+      const gapW = 60 + difficulty * 100 + Math.random() * 40;
+      cx += gapW;
+      // Landing platform
+      const landingW = 120 + Math.random() * 80;
+      const drop = Math.random() * 30 * difficulty;
+      cy = Math.min(cy + drop, H * 0.82);
+      platforms.push({ x: cx, y: cy, w: landingW, angle: 0 });
+      // Collectible above gap
+      if (Math.random() < 0.7) {
+        collectibles.push({ x: cx - gapW * 0.5, y: cy - 80 - Math.random() * 40, collected: false });
+      }
+      cx += landingW;
+    } else if (roll < 0.6 && difficulty > 0.1) {
+      // Moving platform over gap
+      const gapW = 80 + difficulty * 80;
+      const platW = 90 + Math.random() * 40;
+      const platY = cy - 10 + Math.random() * 20;
+      movingPlatforms.push({
+        x: cx + gapW * 0.5 - platW / 2,
+        baseY: platY,
+        y: platY,
+        w: platW,
+        range: 30 + difficulty * 50,
+        speed: 0.015 + difficulty * 0.02,
+        phase: Math.random() * Math.PI * 2
+      });
+      cx += gapW;
+      // Landing after moving platform
+      const landW = 100 + Math.random() * 60;
+      platforms.push({ x: cx, y: cy, w: landW, angle: 0 });
+      // Collectible above moving platform
+      if (Math.random() < 0.5) {
+        collectibles.push({
+          x: cx - gapW * 0.5,
+          y: platY - 55,
+          collected: false
+        });
+      }
+      cx += landW;
+    } else if (roll < 0.72) {
+      // Flat section
+      const flatW = 100 + Math.random() * 150;
+      platforms.push({ x: cx, y: cy, w: flatW, angle: 0 });
+      // Maybe a boost pad
+      if (Math.random() < 0.3 + difficulty * 0.3) {
+        boosts.push({ x: cx + 20 + Math.random() * (flatW - 60), y: cy, w: 50 });
+      }
+      // Sprinkle collectible above flat
+      if (Math.random() < 0.5) {
+        collectibles.push({ x: cx + flatW * 0.5, y: cy - 60 - Math.random() * 30, collected: false });
+      }
+      cx += flatW;
+    } else if (roll < 0.88) {
+      // Hill (up then down)
+      const hillW = 160 + Math.random() * 100;
+      const peak = 40 + difficulty * 60 + Math.random() * 30;
+      platforms.push({ x: cx, y: cy, w: hillW, angle: 0, hill: true, peak: peak });
+      // Collectible at peak
+      if (Math.random() < 0.7) {
+        collectibles.push({ x: cx + hillW * 0.5, y: cy - peak - 40, collected: false });
+      }
+      cx += hillW;
+    } else {
+      // Staircase down
+      const steps = 2 + Math.floor(Math.random() * 3);
+      for (let s = 0; s < steps; s++) {
+        const stepW = 70 + Math.random() * 50;
+        cy = Math.min(cy + 25 + Math.random() * 15, H * 0.82);
+        platforms.push({ x: cx, y: cy, w: stepW, angle: 0 });
+        if (Math.random() < 0.4) {
+          collectibles.push({ x: cx + stepW * 0.5, y: cy - 50, collected: false });
+        }
+        cx += stepW + 15;
+      }
+    }
+
+    // Occasionally reset height upward so level doesn't just go down forever
+    if (cy > H * 0.7 && Math.random() < 0.3) {
+      cx += 20;
+      cy -= 80 + Math.random() * 60;
+      const rampUpW = 120 + Math.random() * 80;
+      platforms.push({ x: cx, y: cy, w: rampUpW, angle: 0 });
+      cx += rampUpW;
+    }
+  }
+
+  // Finish platform
+  platforms.push({ x: cx + 30, y: cy, w: 300, angle: 0, finish: true });
+  levelEnd = cx + 330;
+
+  // Generate background clouds
+  for (let i = 0; i < 30; i++) {
+    clouds.push({
+      x: Math.random() * levelEnd,
+      y: 30 + Math.random() * H * 0.35,
+      r: 20 + Math.random() * 60,
+      speed: 0.1 + Math.random() * 0.3
+    });
+  }
+}
+
+function lerp(a, b, t) { return a + (b - a) * t; }
+
+// ─── INPUT ───────────────────────────────────────────────
+
+// Device orientation
+function handleOrientation(e) {
+  // gamma: left-right tilt, range -90 to 90
+  if (e.gamma !== null) {
+    tiltX = e.gamma;
+    hasMotion = true;
+  }
+}
+
+async function requestMotionPermission() {
+  if (typeof DeviceOrientationEvent !== 'undefined' &&
+      typeof DeviceOrientationEvent.requestPermission === 'function') {
+    // iOS 13+ requires explicit permission
+    const overlay = document.getElementById('perm-overlay');
+    overlay.classList.remove('hidden');
+    return new Promise(resolve => {
+      document.getElementById('perm-btn').addEventListener('click', async () => {
+        try {
+          const perm = await DeviceOrientationEvent.requestPermission();
+          if (perm === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation);
+            motionPermGranted = true;
+          }
+        } catch (err) {
+          console.warn('Motion permission denied:', err);
+        }
+        overlay.classList.add('hidden');
+        resolve();
+      }, { once: true });
+    });
+  } else {
+    // Non-iOS or older browsers: just listen
+    window.addEventListener('deviceorientation', handleOrientation);
+    motionPermGranted = true;
+  }
+}
+
+// Touch
+let touchActive = false;
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  touchActive = true;
+  handleTap();
+}, { passive: false });
+canvas.addEventListener('touchend', e => {
+  e.preventDefault();
+  touchActive = false;
+}, { passive: false });
+canvas.addEventListener('mousedown', () => { touchActive = true; handleTap(); });
+canvas.addEventListener('mouseup', () => { touchActive = false; });
+
+function handleTap() {
+  if (state === 'title') {
+    startGame();
+  } else if (state === 'playing') {
+    tryJump();
+  } else if (state === 'dead' && deathTimer > 40) {
+    initGame();
+    state = 'playing';
+  } else if (state === 'win' && winTimer > 60) {
+    state = 'title';
+  }
+}
+
+function tryJump() {
+  if (donut.grounded) {
+    donut.vy = JUMP_FORCE;
+    donut.grounded = false;
+    spawnParticles(donut.x, donut.y + DONUT_R, 6, C.donutGlaze);
+    sfxJump();
+  }
+}
+
+// Keyboard fallback
+window.addEventListener('keydown', e => {
+  keysDown[e.key] = true;
+  if (e.key === ' ' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    handleTap();
+  }
+});
+window.addEventListener('keyup', e => { keysDown[e.key] = false; });
+
+// ─── PARTICLES ───────────────────────────────────────────
+function spawnParticles(x, y, count, color) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * 6,
+      vy: -Math.random() * 5 - 1,
+      r: 2 + Math.random() * 3,
+      color: color || C.sprinkleColors[Math.floor(Math.random() * C.sprinkleColors.length)],
+      life: 30 + Math.random() * 20
+    });
+  }
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.15;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+// ─── COLLISION HELPERS ───────────────────────────────────
+function getPlatformSurface(plat, worldX) {
+  // Returns the Y of the platform surface at a given world X
+  if (!plat.hill) {
+    if (plat.endY !== undefined) {
+      // Ramp: interpolate Y from start to end
+      const t = clamp((worldX - plat.x) / plat.w, 0, 1);
+      return lerp(plat.y, plat.endY, t);
+    }
+    return plat.y;
+  } else {
+    // Hill: parabolic curve, peak at center
+    const t = clamp((worldX - plat.x) / plat.w, 0, 1);
+    const hillY = plat.y - plat.peak * 4 * t * (1 - t); // parabola peaking at center
+    return hillY;
+  }
+}
+
+function clamp(v, min, max) { return Math.max(min, Math.min(max, v)); }
+
+function isOnPlatform(px, py, plat) {
+  return px >= plat.x - 5 && px <= plat.x + plat.w + 5;
+}
+
+// ─── UPDATE ──────────────────────────────────────────────
+function update() {
+  if (state !== 'playing') return;
+  frameCount++;
+
+  // Tilt input -> horizontal acceleration
+  let inputX = 0;
+  if (hasMotion) {
+    inputX = tiltX * TILT_SENSITIVITY;
+  }
+  // Keyboard fallback
+  if (keysDown['ArrowRight'] || keysDown['d']) inputX += 3.5;
+  if (keysDown['ArrowLeft'] || keysDown['a']) inputX -= 3.5;
+
+  // Base forward drift (donut always wants to roll right a bit due to "downhill")
+  const baseDrift = 1.8;
+  const boostMult = boostTimer > 0 ? BOOST_MULT : 1;
+
+  donut.vx += inputX * 0.15;
+  donut.vx += baseDrift * 0.05;
+  donut.vx *= 0.92; // friction
+  donut.vx = clamp(donut.vx, -MAX_SPEED_X * 0.5, MAX_SPEED_X * boostMult);
+
+  // Gravity
+  donut.vy += GRAVITY;
+  donut.vy = Math.min(donut.vy, 18);
+
+  // Move donut
+  donut.x += donut.vx * boostMult;
+  donut.y += donut.vy;
+
+  // Rotation visual
+  donut.rotation += donut.vx * 0.06;
+
+  // Boost timer
+  if (boostTimer > 0) boostTimer--;
+
+  // Collision with static platforms
+  donut.grounded = false;
+  for (const plat of platforms) {
+    if (!isOnPlatform(donut.x, donut.y, plat)) continue;
+    const surfaceY = getPlatformSurface(plat, donut.x);
+    const donutBottom = donut.y + DONUT_R;
+
+    // Landing on top
+    if (donutBottom >= surfaceY && donutBottom <= surfaceY + 20 && donut.vy >= 0) {
+      donut.y = surfaceY - DONUT_R;
+      donut.vy = 0;
+      donut.grounded = true;
+
+      // On a ramp, add slope-based acceleration
+      if (plat.endY !== undefined) {
+        const slope = (plat.endY - plat.y) / plat.w;
+        donut.vx += slope * 2.5;
+      }
+      // On a hill, adjust velocity based on slope at current position
+      if (plat.hill) {
+        const t = clamp((donut.x - plat.x) / plat.w, 0, 1);
+        const slopeDir = (t < 0.5) ? -1 : 1; // uphill then downhill
+        const slopeMag = Math.abs(t - 0.5) * 2;
+        donut.vx += slopeDir * slopeMag * 1.2;
+      }
+      break;
+    }
+  }
+
+  // Collision with moving platforms
+  for (const mp of movingPlatforms) {
+    mp.y = mp.baseY + Math.sin(frameCount * mp.speed + mp.phase) * mp.range;
+    if (donut.x >= mp.x - 5 && donut.x <= mp.x + mp.w + 5) {
+      const donutBottom = donut.y + DONUT_R;
+      if (donutBottom >= mp.y && donutBottom <= mp.y + 18 && donut.vy >= 0) {
+        donut.y = mp.y - DONUT_R;
+        donut.vy = 0;
+        donut.grounded = true;
+      }
+    }
+  }
+
+  // Collectibles
+  for (const col of collectibles) {
+    if (col.collected) continue;
+    const dx = donut.x - col.x;
+    const dy = donut.y - col.y;
+    if (dx * dx + dy * dy < (DONUT_R + COLLECTIBLE_R) * (DONUT_R + COLLECTIBLE_R)) {
+      col.collected = true;
+      score += 10;
+      sprinklesCollected++;
+      spawnParticles(col.x, col.y, 8, null);
+      sfxCollect();
+    }
+  }
+
+  // Boosts
+  for (const b of boosts) {
+    if (donut.x >= b.x && donut.x <= b.x + b.w) {
+      const surfaceY = b.y;
+      if (Math.abs(donut.y + DONUT_R - surfaceY) < 20) {
+        if (boostTimer <= 0) {
+          spawnParticles(donut.x, donut.y, 10, C.boost);
+          sfxBoost();
+        }
+        boostTimer = BOOST_DURATION;
+      }
+    }
+  }
+
+  // Death: fell off the bottom or too far below nearest platform
+  if (donut.y > camera.y + H + 100) {
+    state = 'dead';
+    deathTimer = 0;
+    sfxDeath();
+  }
+
+  // Win: reached finish
+  const finishPlat = platforms[platforms.length - 1];
+  if (finishPlat.finish && donut.x >= finishPlat.x + 50 && donut.grounded) {
+    state = 'win';
+    winTimer = 0;
+    sfxWin();
+    // Time bonus: roughly 1 point per frame you saved vs a "par" time
+    const parFrames = 3600; // ~60 seconds at 60fps
+    const timeBonus = Math.max(0, Math.floor((parFrames - frameCount) * 0.5));
+    score += timeBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      localStorage.setItem('donutDashBest', bestScore.toString());
+    }
+  }
+
+  // Camera
+  const targetCamX = donut.x - W * 0.3;
+  const targetCamY = donut.y - H * 0.5;
+  camera.x += (targetCamX - camera.x) * 0.08;
+  camera.y += (targetCamY - camera.y) * 0.06;
+
+  updateParticles();
+}
+
+// ─── RENDER ──────────────────────────────────────────────
+function render() {
+  // Sky gradient
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, C.sky1);
+  grad.addColorStop(1, C.sky2);
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.save();
+  ctx.translate(-camera.x, -camera.y);
+
+  // Clouds (parallax)
+  for (const cl of clouds) {
+    const px = cl.x - camera.x * 0.3;
+    const py = cl.y - camera.y * 0.1;
+    ctx.fillStyle = C.cloud;
+    ctx.beginPath();
+    ctx.arc(px + camera.x, py + camera.y, cl.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // Platforms
+  for (const plat of platforms) {
+    drawPlatform(plat);
+  }
+
+  // Moving platforms
+  for (const mp of movingPlatforms) {
+    drawMovingPlatform(mp);
+  }
+
+  // Boosts
+  for (const b of boosts) {
+    drawBoost(b);
+  }
+
+  // Collectibles
+  for (const col of collectibles) {
+    if (!col.collected) drawCollectible(col);
+  }
+
+  // Finish line
+  const finishPlat = platforms[platforms.length - 1];
+  if (finishPlat && finishPlat.finish) {
+    drawFinishLine(finishPlat);
+  }
+
+  // Particles
+  for (const p of particles) {
+    ctx.globalAlpha = p.life / 50;
+    ctx.fillStyle = p.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+
+  // Donut
+  if (state === 'playing' || state === 'win') {
+    drawDonut(donut.x, donut.y, donut.rotation);
+  }
+
+  ctx.restore();
+
+  // HUD
+  if (state === 'playing') drawHUD();
+
+  // Screens
+  if (state === 'title') drawTitle();
+  if (state === 'dead') drawDeath();
+  if (state === 'win') drawWin();
+}
+
+function drawPlatform(plat) {
+  ctx.save();
+  if (plat.hill) {
+    // Draw hill as curved surface
+    ctx.beginPath();
+    ctx.moveTo(plat.x, plat.y);
+    const peakX = plat.x + plat.w / 2;
+    const peakY = plat.y - plat.peak;
+    ctx.quadraticCurveTo(peakX, peakY, plat.x + plat.w, plat.y);
+    ctx.lineTo(plat.x + plat.w, plat.y + PLATFORM_H);
+    ctx.lineTo(plat.x, plat.y + PLATFORM_H);
+    ctx.closePath();
+    ctx.fillStyle = C.hill;
+    ctx.fill();
+    // Top edge highlight
+    ctx.beginPath();
+    ctx.moveTo(plat.x, plat.y);
+    ctx.quadraticCurveTo(peakX, peakY, plat.x + plat.w, plat.y);
+    ctx.strokeStyle = C.platformEdge;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  } else if (plat.endY !== undefined) {
+    // Ramp (angled)
+    ctx.beginPath();
+    ctx.moveTo(plat.x, plat.y);
+    ctx.lineTo(plat.x + plat.w, plat.endY);
+    ctx.lineTo(plat.x + plat.w, plat.endY + PLATFORM_H);
+    ctx.lineTo(plat.x, plat.y + PLATFORM_H);
+    ctx.closePath();
+    ctx.fillStyle = C.platform;
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(plat.x, plat.y);
+    ctx.lineTo(plat.x + plat.w, plat.endY);
+    ctx.strokeStyle = C.platformEdge;
+    ctx.lineWidth = 2;
+    ctx.stroke();
+  } else {
+    // Flat platform
+    ctx.fillStyle = plat.finish ? '#2d1a4a' : C.platform;
+    ctx.fillRect(plat.x, plat.y, plat.w, PLATFORM_H);
+    // Top highlight
+    ctx.fillStyle = plat.finish ? C.finishLine : C.platformTop;
+    ctx.fillRect(plat.x, plat.y, plat.w, 3);
+    // Candy stripe edge (decorative)
+    if (!plat.finish) {
+      ctx.fillStyle = C.platformEdge;
+      ctx.fillRect(plat.x, plat.y + PLATFORM_H - 2, plat.w, 2);
+    }
+  }
+  ctx.restore();
+}
+
+function drawMovingPlatform(mp) {
+  // Glow
+  ctx.fillStyle = 'rgba(255,158,207,0.15)';
+  ctx.fillRect(mp.x - 4, mp.y - 4, mp.w + 8, PLATFORM_H + 8);
+  // Platform body
+  ctx.fillStyle = C.movingPlat;
+  ctx.fillRect(mp.x, mp.y, mp.w, PLATFORM_H);
+  // Edge
+  ctx.fillStyle = C.movingEdge;
+  ctx.fillRect(mp.x, mp.y, mp.w, 3);
+  // Little arrows indicating movement
+  ctx.fillStyle = 'rgba(255,255,255,0.4)';
+  const arrowY = mp.y + PLATFORM_H / 2;
+  ctx.beginPath();
+  ctx.moveTo(mp.x + mp.w / 2 - 5, arrowY - 3);
+  ctx.lineTo(mp.x + mp.w / 2, arrowY - 7);
+  ctx.lineTo(mp.x + mp.w / 2 + 5, arrowY - 3);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.moveTo(mp.x + mp.w / 2 - 5, arrowY + 3);
+  ctx.lineTo(mp.x + mp.w / 2, arrowY + 7);
+  ctx.lineTo(mp.x + mp.w / 2 + 5, arrowY + 3);
+  ctx.fill();
+}
+
+function drawBoost(b) {
+  const pulse = Math.sin(frameCount * 0.1) * 0.2 + 0.8;
+  ctx.fillStyle = C.boostGlow;
+  ctx.fillRect(b.x - 5, b.y - 10, b.w + 10, 12);
+  ctx.fillStyle = C.boost;
+  ctx.globalAlpha = pulse;
+  ctx.fillRect(b.x, b.y - 5, b.w, 5);
+  ctx.globalAlpha = 1;
+  // Chevrons
+  ctx.strokeStyle = '#fff';
+  ctx.lineWidth = 2;
+  for (let i = 0; i < 3; i++) {
+    const cx = b.x + 10 + i * 15;
+    ctx.beginPath();
+    ctx.moveTo(cx, b.y - 1);
+    ctx.lineTo(cx + 5, b.y - 5);
+    ctx.lineTo(cx + 10, b.y - 1);
+    ctx.stroke();
+  }
+}
+
+function drawCollectible(col) {
+  const bob = Math.sin(frameCount * 0.08 + col.x * 0.1) * 4;
+  const sparkle = Math.sin(frameCount * 0.15 + col.x) * 0.3 + 0.7;
+  // Glow
+  ctx.fillStyle = `rgba(255,255,100,${sparkle * 0.3})`;
+  ctx.beginPath();
+  ctx.arc(col.x, col.y + bob, COLLECTIBLE_R + 4, 0, Math.PI * 2);
+  ctx.fill();
+  // Sprinkle body (star shape)
+  ctx.fillStyle = C.sprinkleColors[Math.floor(col.x * 7) % C.sprinkleColors.length];
+  ctx.beginPath();
+  const r = COLLECTIBLE_R;
+  for (let i = 0; i < 5; i++) {
+    const a = (i * Math.PI * 2) / 5 - Math.PI / 2 + frameCount * 0.03;
+    const outerX = col.x + Math.cos(a) * r;
+    const outerY = col.y + bob + Math.sin(a) * r;
+    if (i === 0) ctx.moveTo(outerX, outerY);
+    else ctx.lineTo(outerX, outerY);
+    const innerA = a + Math.PI / 5;
+    const innerX = col.x + Math.cos(innerA) * r * 0.4;
+    const innerY = col.y + bob + Math.sin(innerA) * r * 0.4;
+    ctx.lineTo(innerX, innerY);
+  }
+  ctx.closePath();
+  ctx.fill();
+}
+
+function drawFinishLine(plat) {
+  // Checkered flag pole
+  const flagX = plat.x + plat.w - 40;
+  const flagY = plat.y - 80;
+  ctx.fillStyle = '#888';
+  ctx.fillRect(flagX, flagY, 4, 80);
+  // Flag
+  const flagW = 40;
+  const flagH = 25;
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 5; c++) {
+      ctx.fillStyle = (r + c) % 2 === 0 ? '#fff' : '#333';
+      ctx.fillRect(flagX + 4 + c * (flagW / 5), flagY + r * (flagH / 3), flagW / 5, flagH / 3);
+    }
+  }
+  // "FINISH" text
+  ctx.fillStyle = C.finishLine;
+  ctx.font = 'bold 18px Trebuchet MS, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('FINISH', plat.x + plat.w / 2, plat.y - 10);
+}
+
+function drawDonut(x, y, rot) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.rotate(rot);
+
+  // Donut shadow
+  ctx.fillStyle = 'rgba(0,0,0,0.2)';
+  ctx.beginPath();
+  ctx.ellipse(2, DONUT_R + 4, DONUT_R * 0.9, 5, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Outer glaze (pink frosted surface)
+  ctx.fillStyle = C.donutGlaze;
+  ctx.beginPath();
+  ctx.arc(0, 0, DONUT_R, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Bread ring visible at edge
+  ctx.strokeStyle = C.donutBase;
+  ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.arc(0, 0, DONUT_R - 1, 0, Math.PI * 2);
+  ctx.stroke();
+
+  // Inner bread ring around hole
+  ctx.fillStyle = C.donutBase;
+  ctx.beginPath();
+  ctx.arc(0, 0, DONUT_HOLE + 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Hole
+  ctx.fillStyle = '#2a1508';
+  ctx.beginPath();
+  ctx.arc(0, 0, DONUT_HOLE, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Sprinkles on the donut
+  const sprinklePositions = [
+    { a: 0.4, r: 14 }, { a: 1.0, r: 16 }, { a: 1.6, r: 13 },
+    { a: 2.2, r: 15 }, { a: 2.9, r: 14 }, { a: 3.5, r: 16 },
+    { a: 4.2, r: 13 }, { a: 4.8, r: 15 }, { a: 5.5, r: 14 },
+  ];
+  for (let i = 0; i < sprinklePositions.length; i++) {
+    const sp = sprinklePositions[i];
+    const sx = Math.cos(sp.a) * sp.r;
+    const sy = Math.sin(sp.a) * sp.r;
+    ctx.fillStyle = C.sprinkleColors[i % C.sprinkleColors.length];
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(sp.a + 0.5);
+    ctx.fillRect(-3, -1, 6, 2);
+    ctx.restore();
+  }
+
+  // Highlight
+  ctx.fillStyle = 'rgba(255,255,255,0.25)';
+  ctx.beginPath();
+  ctx.arc(-5, -6, 6, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Boost glow
+  if (boostTimer > 0) {
+    ctx.strokeStyle = `rgba(0,229,255,${boostTimer / BOOST_DURATION * 0.6})`;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.arc(0, 0, DONUT_R + 4, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
+function drawHUD() {
+  // Sprinkle count
+  ctx.fillStyle = C.text;
+  ctx.font = 'bold 20px Trebuchet MS, sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('Sprinkles: ' + sprinklesCollected, 16, 32);
+
+  // Score
+  ctx.textAlign = 'right';
+  ctx.fillText('Score: ' + score, W - 16, 32);
+
+  // Progress bar
+  const barW = W * 0.4;
+  const barH = 8;
+  const barX = (W - barW) / 2;
+  const barY = 14;
+  const progress = clamp(donut.x / levelEnd, 0, 1);
+
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fillRect(barX, barY, barW, barH);
+  const progGrad = ctx.createLinearGradient(barX, 0, barX + barW * progress, 0);
+  progGrad.addColorStop(0, '#ff6eb4');
+  progGrad.addColorStop(1, '#ffcc00');
+  ctx.fillStyle = progGrad;
+  ctx.fillRect(barX, barY, barW * progress, barH);
+
+  // Donut icon on progress bar
+  ctx.fillStyle = C.donutGlaze;
+  ctx.beginPath();
+  ctx.arc(barX + barW * progress, barY + barH / 2, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = C.donutHole;
+  ctx.beginPath();
+  ctx.arc(barX + barW * progress, barY + barH / 2, 2.5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Boost indicator
+  if (boostTimer > 0) {
+    ctx.fillStyle = C.boost;
+    ctx.font = 'bold 16px Trebuchet MS, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('BOOST!', W / 2, H - 30);
+  }
+
+  // Tilt indicator (small)
+  if (hasMotion) {
+    const indicatorX = W / 2;
+    const indicatorY = H - 14;
+    const tiltVis = clamp(tiltX / 30, -1, 1);
+    ctx.fillStyle = 'rgba(255,255,255,0.2)';
+    ctx.fillRect(indicatorX - 30, indicatorY - 2, 60, 4);
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.beginPath();
+    ctx.arc(indicatorX + tiltVis * 28, indicatorY, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+function drawTitle() {
+  // Dim overlay
+  ctx.fillStyle = 'rgba(26,10,46,0.7)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Title
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C.donutGlaze;
+  ctx.font = 'bold 52px Trebuchet MS, sans-serif';
+  ctx.fillText('DONUT DASH', W / 2, H * 0.3);
+
+  // Subtitle donut
+  drawDonut(W / 2, H * 0.45, frameCount * 0.02);
+
+  // Instructions
+  ctx.fillStyle = C.text;
+  ctx.font = '18px Trebuchet MS, sans-serif';
+  const isMobile = 'ontouchstart' in window;
+  if (isMobile) {
+    ctx.fillText('Tilt phone to steer', W / 2, H * 0.62);
+    ctx.fillText('Tap to jump', W / 2, H * 0.68);
+  } else {
+    ctx.fillText('Arrow keys / A,D to move', W / 2, H * 0.62);
+    ctx.fillText('Space / Up to jump', W / 2, H * 0.68);
+  }
+
+  // Start prompt
+  const pulse = Math.sin(frameCount * 0.06) * 0.3 + 0.7;
+  ctx.globalAlpha = pulse;
+  ctx.fillStyle = C.finishLine;
+  ctx.font = 'bold 22px Trebuchet MS, sans-serif';
+  ctx.fillText(isMobile ? 'TAP TO START' : 'PRESS SPACE TO START', W / 2, H * 0.82);
+  ctx.globalAlpha = 1;
+
+  // Best score
+  if (bestScore > 0) {
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = '14px Trebuchet MS, sans-serif';
+    ctx.fillText('Best: ' + bestScore, W / 2, H * 0.9);
+  }
+}
+
+function drawDeath() {
+  deathTimer++;
+  ctx.fillStyle = 'rgba(26,10,46,0.75)';
+  ctx.fillRect(0, 0, W, H);
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#ff4444';
+  ctx.font = 'bold 44px Trebuchet MS, sans-serif';
+  ctx.fillText('SPLAT!', W / 2, H * 0.35);
+
+  ctx.fillStyle = C.text;
+  ctx.font = '20px Trebuchet MS, sans-serif';
+  ctx.fillText('The donut fell!', W / 2, H * 0.45);
+  ctx.fillText('Sprinkles: ' + sprinklesCollected + '  Score: ' + score, W / 2, H * 0.55);
+
+  if (deathTimer > 40) {
+    const pulse = Math.sin(frameCount * 0.06) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = C.donutGlaze;
+    ctx.font = 'bold 20px Trebuchet MS, sans-serif';
+    ctx.fillText('TAP TO TRY AGAIN', W / 2, H * 0.7);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function drawWin() {
+  winTimer++;
+  ctx.fillStyle = 'rgba(26,10,46,0.65)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Confetti
+  if (winTimer < 180) {
+    for (let i = 0; i < 3; i++) {
+      particles.push({
+        x: camera.x + Math.random() * W,
+        y: camera.y + Math.random() * H * 0.3,
+        vx: (Math.random() - 0.5) * 4,
+        vy: Math.random() * 2 + 1,
+        r: 3 + Math.random() * 4,
+        color: C.sprinkleColors[Math.floor(Math.random() * C.sprinkleColors.length)],
+        life: 60 + Math.random() * 40
+      });
+    }
+  }
+
+  ctx.textAlign = 'center';
+  ctx.fillStyle = C.finishLine;
+  ctx.font = 'bold 48px Trebuchet MS, sans-serif';
+  ctx.fillText('YOU DID IT!', W / 2, H * 0.28);
+
+  drawDonut(W / 2, H * 0.42, frameCount * 0.03);
+
+  ctx.fillStyle = C.text;
+  ctx.font = '22px Trebuchet MS, sans-serif';
+  ctx.fillText('Sprinkles: ' + sprinklesCollected, W / 2, H * 0.57);
+  ctx.fillText('Score: ' + score, W / 2, H * 0.64);
+
+  if (score >= bestScore && bestScore > 0) {
+    ctx.fillStyle = C.finishLine;
+    ctx.font = 'bold 18px Trebuchet MS, sans-serif';
+    ctx.fillText('NEW BEST!', W / 2, H * 0.71);
+  }
+
+  if (winTimer > 60) {
+    const pulse = Math.sin(frameCount * 0.06) * 0.3 + 0.7;
+    ctx.globalAlpha = pulse;
+    ctx.fillStyle = C.donutGlaze;
+    ctx.font = 'bold 20px Trebuchet MS, sans-serif';
+    ctx.fillText('TAP TO PLAY AGAIN', W / 2, H * 0.84);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ─── GAME LOOP ───────────────────────────────────────────
+function loop() {
+  update();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// ─── START ───────────────────────────────────────────────
+async function startGame() {
+  if (!motionPermGranted) {
+    await requestMotionPermission();
+  }
+  initGame();
+  state = 'playing';
+}
+
+// Init
+initGame();
+state = 'title';
+loop();
+</script>
+</body>
+</html>
