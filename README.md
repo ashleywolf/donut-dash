@@ -2,6 +2,8 @@
 
 A phone-tilt obstacle course game for kids. Steer a donut down a ramp by tilting your phone left and right. Tap to jump over gaps, land on moving platforms, collect sprinkles, and hit frosting boost pads to reach the finish line.
 
+**[Play now](https://ashleywolf.github.io/donut-dash/)**
+
 ## How to Play
 
 **On mobile (recommended):**
@@ -26,4 +28,4 @@ A phone-tilt obstacle course game for kids. Steer a donut down a ramp by tilting
 
 ## Play It
 
-Open `index.html` in a mobile browser, or visit the GitHub Pages URL after deployment.
+Open on your phone: **https://ashleywolf.github.io/donut-dash/**
